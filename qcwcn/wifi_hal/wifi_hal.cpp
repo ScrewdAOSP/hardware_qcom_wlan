@@ -157,7 +157,7 @@ static int no_seq_check(struct nl_msg *msg, void *arg)
 static wifi_error acquire_supported_features(wifi_interface_handle iface,
         feature_set *set)
 {
-    int ret = 0;
+    wifi_error ret;
     interface_info *iinfo = getIfaceInfo(iface);
     wifi_handle handle = getWifiHandle(iface);
     *set = 0;
@@ -168,15 +168,15 @@ static wifi_error acquire_supported_features(wifi_interface_handle iface,
 
     /* create the message */
     ret = supportedFeatures.create();
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     ret = supportedFeatures.set_iface_id(iinfo->name);
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     ret = supportedFeatures.requestResponse();
-    if (ret != 0) {
+    if (ret != WIFI_SUCCESS) {
         ALOGE("%s: requestResponse Error:%d",__func__, ret);
         goto cleanup;
     }
@@ -184,7 +184,7 @@ static wifi_error acquire_supported_features(wifi_interface_handle iface,
     supportedFeatures.getResponseparams(set);
 
 cleanup:
-    return mapErrorKernelToWifiHAL(ret);
+    return ret;
 }
 
 static wifi_error wifi_get_capabilities(wifi_interface_handle handle)
@@ -212,7 +212,7 @@ static wifi_error wifi_get_capabilities(wifi_interface_handle handle)
                             QCA_NL80211_VENDOR_SUBCMD_GSCAN_GET_CAPABILITIES);
     if (!wifihalGeneric) {
         ALOGE("%s: Failed to create object of WifihalGeneric class", __FUNCTION__);
-        return WIFI_ERROR_UNKNOWN;
+        return WIFI_ERROR_OUT_OF_MEMORY;
     }
 
     ret = wifihalGeneric->wifiGetCapabilities(handle);
@@ -224,7 +224,7 @@ static wifi_error wifi_get_capabilities(wifi_interface_handle handle)
 static wifi_error get_firmware_bus_max_size_supported(
                                                 wifi_interface_handle iface)
 {
-    int ret = 0;
+    wifi_error ret;
     interface_info *iinfo = getIfaceInfo(iface);
     wifi_handle handle = getWifiHandle(iface);
     hal_info *info = (hal_info *)handle;
@@ -235,22 +235,22 @@ static wifi_error get_firmware_bus_max_size_supported(
 
     /* create the message */
     ret = busSizeSupported.create();
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     ret = busSizeSupported.set_iface_id(iinfo->name);
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     ret = busSizeSupported.requestResponse();
-    if (ret != 0) {
+    if (ret != WIFI_SUCCESS) {
         ALOGE("%s: requestResponse Error:%d", __FUNCTION__, ret);
         goto cleanup;
     }
     info->firmware_bus_max_size = busSizeSupported.getBusSize();
 
 cleanup:
-    return mapErrorKernelToWifiHAL(ret);
+    return ret;
 }
 
 static wifi_error wifi_init_user_sock(hal_info *info)
@@ -411,8 +411,7 @@ wifi_error init_wifi_vendor_hal_func_table(wifi_hal_fn *fn) {
     fn->wifi_get_roaming_capabilities = wifi_get_roaming_capabilities;
     fn->wifi_configure_roaming = wifi_configure_roaming;
     fn->wifi_enable_firmware_roaming = wifi_enable_firmware_roaming;
-    fn->wifi_select_tx_power_scenario = wifi_select_tx_power_scenario;
-    fn->wifi_reset_tx_power_scenario = wifi_reset_tx_power_scenario;
+    fn->wifi_set_qpower = wifi_set_qpower;
 
     return WIFI_SUCCESS;
 }
@@ -431,6 +430,15 @@ static void cld80211lib_cleanup(hal_info *info)
     info->cldctx = NULL;
 }
 
+static int wifi_get_iface_id(hal_info *info, const char *iface)
+{
+    int i;
+    for (i = 0; i < info->num_interfaces; i++)
+        if (!strcmp(info->interfaces[i]->name, iface))
+            return i;
+    return -1;
+}
+
 wifi_error wifi_initialize(wifi_handle *handle)
 {
     int err = 0;
@@ -440,6 +448,7 @@ wifi_error wifi_initialize(wifi_handle *handle)
     struct nl_sock *event_sock = NULL;
     struct nl_cb *cb = NULL;
     int status = 0;
+    int index;
 
     ALOGI("Initializing wifi");
     hal_info *info = (hal_info *)malloc(sizeof(hal_info));
@@ -591,17 +600,17 @@ wifi_error wifi_initialize(wifi_handle *handle)
         goto unload;
     }
 
-    iface_handle = wifi_get_iface_handle((info->interfaces[0])->handle,
-            (info->interfaces[0])->name);
-    if (iface_handle == NULL) {
+    index = wifi_get_iface_id(info, "wlan0");
+    if (index == -1) {
         int i;
         for (i = 0; i < info->num_interfaces; i++)
         {
             free(info->interfaces[i]);
         }
-        ALOGE("%s no iface with %s\n", __func__, info->interfaces[0]->name);
+        ALOGE("%s no iface with wlan0", __func__);
         goto unload;
     }
+    iface_handle = (wifi_interface_handle)info->interfaces[index];
 
     ret = acquire_supported_features(iface_handle,
             &info->supported_feature_set);
@@ -610,6 +619,13 @@ wifi_error wifi_initialize(wifi_handle *handle)
         //acquire_supported_features failure is acceptable condition as legacy
         //drivers might not support the required vendor command. So, do not
         //consider it as failure of wifi_initialize
+        ret = WIFI_SUCCESS;
+    }
+
+    ret =  wifi_get_logger_supported_feature_set(iface_handle,
+                         &info->supported_logger_feature_set);
+    if (ret != WIFI_SUCCESS) {
+        ALOGE("Failed to get supported logger featur set: %d", ret);
         ret = WIFI_SUCCESS;
     }
 
@@ -735,6 +751,18 @@ static void internal_cleaned_up_handler(wifi_handle handle)
         info->cmd_sock = NULL;
         info->event_sock = NULL;
     }
+
+    if (info->interfaces) {
+        for (int i = 0; i < info->num_interfaces; i++)
+            free(info->interfaces[i]);
+        free(info->interfaces);
+    }
+
+    if (info->cmd)
+        free(info->cmd);
+
+    if (info->event_cb)
+        free(info->event_cb);
 
     if (info->cldctx != NULL) {
         cld80211lib_cleanup(info);
@@ -955,13 +983,13 @@ public:
         return mId;
     }
 
-    virtual int create() {
+    virtual wifi_error create() {
         int nlctrlFamily = genl_ctrl_resolve(mInfo->cmd_sock, "nlctrl");
         // ALOGI("ctrl family = %d", nlctrlFamily);
-        int ret = mMsg.create(nlctrlFamily, CTRL_CMD_GETFAMILY, 0, 0);
-        if (ret < 0) {
+        wifi_error ret = mMsg.create(nlctrlFamily, CTRL_CMD_GETFAMILY, 0, 0);
+        if (ret != WIFI_SUCCESS)
             return ret;
-        }
+
         ret = mMsg.put_string(CTRL_ATTR_FAMILY_NAME, mName);
         return ret;
     }
@@ -1148,7 +1176,7 @@ wifi_error wifi_get_concurrency_matrix(wifi_interface_handle handle,
                                        int set_size_max,
                                        feature_set set[], int *set_size)
 {
-    int ret = 0;
+    wifi_error ret;
     struct nlattr *nlData;
     WifihalGeneric *vCommand = NULL;
     interface_info *ifaceInfo = getIfaceInfo(handle);
@@ -1170,11 +1198,11 @@ wifi_error wifi_get_concurrency_matrix(wifi_interface_handle handle,
 
     /* Create the message */
     ret = vCommand->create();
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     ret = vCommand->set_iface_id(ifaceInfo->name);
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     /* Add the vendor specific attributes for the NL command. */
@@ -1182,12 +1210,12 @@ wifi_error wifi_get_concurrency_matrix(wifi_interface_handle handle,
     if (!nlData)
         goto cleanup;
 
-    if (vCommand->put_u32(
-        QCA_WLAN_VENDOR_ATTR_GET_CONCURRENCY_MATRIX_CONFIG_PARAM_SET_SIZE_MAX,
-        set_size_max))
-    {
+    ret = vCommand->put_u32(
+          QCA_WLAN_VENDOR_ATTR_GET_CONCURRENCY_MATRIX_CONFIG_PARAM_SET_SIZE_MAX,
+          set_size_max);
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
-    }
+
     vCommand->attr_end(nlData);
 
     /* Populate the input received from caller/framework. */
@@ -1196,22 +1224,20 @@ wifi_error wifi_get_concurrency_matrix(wifi_interface_handle handle,
     vCommand->setConcurrencySet(set);
 
     ret = vCommand->requestResponse();
-    if (ret) {
+    if (ret != WIFI_SUCCESS)
         ALOGE("%s: requestResponse() error: %d", __func__, ret);
-    }
 
 cleanup:
     delete vCommand;
-    if (ret) {
+    if (ret)
         *set_size = 0;
-    }
-    return mapErrorKernelToWifiHAL(ret);
+    return ret;
 }
 
 
 wifi_error wifi_set_nodfs_flag(wifi_interface_handle handle, u32 nodfs)
 {
-    int ret = 0;
+    wifi_error ret;
     struct nlattr *nlData;
     WifiVendorCommand *vCommand = NULL;
     interface_info *ifaceInfo = getIfaceInfo(handle);
@@ -1227,11 +1253,11 @@ wifi_error wifi_set_nodfs_flag(wifi_interface_handle handle, u32 nodfs)
 
     /* Create the message */
     ret = vCommand->create();
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     ret = vCommand->set_iface_id(ifaceInfo->name);
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     /* Add the vendor specific attributes for the NL command. */
@@ -1240,9 +1266,9 @@ wifi_error wifi_set_nodfs_flag(wifi_interface_handle handle, u32 nodfs)
         goto cleanup;
 
     /* Add the fixed part of the mac_oui to the nl command */
-    if (vCommand->put_u32(QCA_WLAN_VENDOR_ATTR_SET_NO_DFS_FLAG, nodfs)) {
+    ret = vCommand->put_u32(QCA_WLAN_VENDOR_ATTR_SET_NO_DFS_FLAG, nodfs);
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
-    }
 
     vCommand->attr_end(nlData);
 
@@ -1251,7 +1277,7 @@ wifi_error wifi_set_nodfs_flag(wifi_interface_handle handle, u32 nodfs)
 
 cleanup:
     delete vCommand;
-    return mapErrorKernelToWifiHAL(ret);
+    return ret;
 }
 
 wifi_error wifi_start_sending_offloaded_packet(wifi_request_id id,
@@ -1262,7 +1288,7 @@ wifi_error wifi_start_sending_offloaded_packet(wifi_request_id id,
                                                u8 *dst_mac_addr,
                                                u32 period_msec)
 {
-    int ret = WIFI_SUCCESS;
+    wifi_error ret;
     struct nlattr *nlData;
     WifiVendorCommand *vCommand = NULL;
 
@@ -1271,7 +1297,7 @@ wifi_error wifi_start_sending_offloaded_packet(wifi_request_id id,
                                 &vCommand);
     if (ret != WIFI_SUCCESS) {
         ALOGE("%s: Initialization failed", __func__);
-        return mapErrorKernelToWifiHAL(ret);
+        return ret;
     }
 
     ALOGV("ip packet length : %u\nIP Packet:", ip_packet_len);
@@ -1285,43 +1311,52 @@ wifi_error wifi_start_sending_offloaded_packet(wifi_request_id id,
     if (!nlData)
         goto cleanup;
 
-    if (vCommand->put_u32(
-            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_SENDING_CONTROL,
-            QCA_WLAN_OFFLOADED_PACKETS_SENDING_START) ||
-        vCommand->put_u32(
-            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_REQUEST_ID,
-            id) ||
-        vCommand->put_bytes(
-            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_IP_PACKET,
-            (const char *)ip_packet, ip_packet_len) ||
-        vCommand->put_addr(
-            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_SRC_MAC_ADDR,
-            src_mac_addr) ||
-        vCommand->put_addr(
-            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_DST_MAC_ADDR,
-            dst_mac_addr) ||
-        vCommand->put_u32(
-            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_PERIOD,
-            period_msec))
-    {
+    ret = vCommand->put_u32(
+                         QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_SENDING_CONTROL,
+                         QCA_WLAN_OFFLOADED_PACKETS_SENDING_START);
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
-    }
+
+    ret = vCommand->put_u32(QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_REQUEST_ID,
+                            id);
+    if (ret != WIFI_SUCCESS)
+        goto cleanup;
+
+    ret = vCommand->put_bytes(QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_IP_PACKET,
+                              (const char *)ip_packet, ip_packet_len);
+    if (ret != WIFI_SUCCESS)
+        goto cleanup;
+
+    ret = vCommand->put_addr(
+                            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_SRC_MAC_ADDR,
+                            src_mac_addr);
+    if (ret != WIFI_SUCCESS)
+        goto cleanup;
+
+    ret = vCommand->put_addr(
+                            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_DST_MAC_ADDR,
+                            dst_mac_addr);
+    if (ret != WIFI_SUCCESS)
+        goto cleanup;
+
+    ret = vCommand->put_u32(QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_PERIOD,
+                            period_msec);
 
     vCommand->attr_end(nlData);
 
     ret = vCommand->requestResponse();
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
 cleanup:
     delete vCommand;
-    return mapErrorKernelToWifiHAL(ret);
+    return ret;
 }
 
 wifi_error wifi_stop_sending_offloaded_packet(wifi_request_id id,
                                               wifi_interface_handle iface)
 {
-    int ret = WIFI_SUCCESS;
+    wifi_error ret;
     struct nlattr *nlData;
     WifiVendorCommand *vCommand = NULL;
 
@@ -1330,7 +1365,7 @@ wifi_error wifi_stop_sending_offloaded_packet(wifi_request_id id,
                                 &vCommand);
     if (ret != WIFI_SUCCESS) {
         ALOGE("%s: Initialization failed", __func__);
-        return mapErrorKernelToWifiHAL(ret);
+        return ret;
     }
 
     /* Add the vendor specific attributes for the NL command. */
@@ -1338,32 +1373,32 @@ wifi_error wifi_stop_sending_offloaded_packet(wifi_request_id id,
     if (!nlData)
         goto cleanup;
 
-    if (vCommand->put_u32(
-            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_SENDING_CONTROL,
-            QCA_WLAN_OFFLOADED_PACKETS_SENDING_STOP) ||
-        vCommand->put_u32(
-            QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_REQUEST_ID,
-            id))
-    {
+    ret = vCommand->put_u32(
+                         QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_SENDING_CONTROL,
+                         QCA_WLAN_OFFLOADED_PACKETS_SENDING_STOP);
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
-    }
 
+    ret = vCommand->put_u32(QCA_WLAN_VENDOR_ATTR_OFFLOADED_PACKETS_REQUEST_ID,
+                            id);
+    if (ret != WIFI_SUCCESS)
+        goto cleanup;
 
     vCommand->attr_end(nlData);
 
     ret = vCommand->requestResponse();
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
 cleanup:
     delete vCommand;
-    return mapErrorKernelToWifiHAL(ret);
+    return ret;
 }
 
 static wifi_error wifi_set_packet_filter(wifi_interface_handle iface,
                                          const u8 *program, u32 len)
 {
-    int ret = WIFI_SUCCESS;
+    wifi_error ret;
     struct nlattr *nlData;
     WifiVendorCommand *vCommand = NULL;
     u32 current_offset = 0;
@@ -1383,7 +1418,7 @@ static wifi_error wifi_set_packet_filter(wifi_interface_handle iface,
                                     &vCommand);
         if (ret != WIFI_SUCCESS) {
             ALOGE("%s: Initialization failed", __FUNCTION__);
-            return mapErrorKernelToWifiHAL(ret);
+            return ret;
         }
 
         /* Add the vendor specific attributes for the NL command. */
@@ -1391,28 +1426,32 @@ static wifi_error wifi_set_packet_filter(wifi_interface_handle iface,
         if (!nlData)
             goto cleanup;
 
-        if (vCommand->put_u32(
-                QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_SUB_CMD,
-                QCA_WLAN_SET_PACKET_FILTER) ||
-            vCommand->put_u32(
-                QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_ID,
-                PACKET_FILTER_ID) ||
-            vCommand->put_u32(
-                QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_TOTAL_LENGTH,
-                len) ||
-            vCommand->put_u32(
-                QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_CURRENT_OFFSET,
-                current_offset)) {
-            ALOGE("%s: failed to put subcmd/program", __FUNCTION__);
+        ret = vCommand->put_u32(QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_SUB_CMD,
+                                QCA_WLAN_SET_PACKET_FILTER);
+        if (ret != WIFI_SUCCESS)
             goto cleanup;
-        }
+        ret = vCommand->put_u32(QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_ID,
+                                PACKET_FILTER_ID);
+        if (ret != WIFI_SUCCESS)
+            goto cleanup;
+        ret = vCommand->put_u32(QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_TOTAL_LENGTH,
+                                len);
+        if (ret != WIFI_SUCCESS)
+            goto cleanup;
+        ret = vCommand->put_u32(
+                            QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_CURRENT_OFFSET,
+                            current_offset);
+        if (ret != WIFI_SUCCESS)
+            goto cleanup;
 
         if (len) {
-            if(vCommand->put_bytes(QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_PROGRAM,
-                                   (char *)&program[current_offset],
-                                   min(info->firmware_bus_max_size,
-                                   len-current_offset))) {
-                ALOGE("%s: failed to put subcmd", __FUNCTION__);
+            ret = vCommand->put_bytes(
+                                     QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_PROGRAM,
+                                     (char *)&program[current_offset],
+                                     min(info->firmware_bus_max_size,
+                                     len-current_offset));
+            if (ret!= WIFI_SUCCESS) {
+                ALOGE("%s: failed to put program", __FUNCTION__);
                 goto cleanup;
             }
         }
@@ -1420,7 +1459,7 @@ static wifi_error wifi_set_packet_filter(wifi_interface_handle iface,
         vCommand->attr_end(nlData);
 
         ret = vCommand->requestResponse();
-        if (ret < 0) {
+        if (ret != WIFI_SUCCESS) {
             ALOGE("%s: requestResponse Error:%d",__func__, ret);
             goto cleanup;
         }
@@ -1435,13 +1474,13 @@ static wifi_error wifi_set_packet_filter(wifi_interface_handle iface,
 cleanup:
     if (vCommand)
         delete vCommand;
-    return mapErrorKernelToWifiHAL(ret);
+    return ret;
 }
 
 static wifi_error wifi_get_packet_filter_capabilities(
                 wifi_interface_handle handle, u32 *version, u32 *max_len)
 {
-    int ret = 0;
+    wifi_error ret;
     struct nlattr *nlData;
     WifihalGeneric *vCommand = NULL;
     interface_info *ifaceInfo = getIfaceInfo(handle);
@@ -1463,11 +1502,11 @@ static wifi_error wifi_get_packet_filter_capabilities(
 
     /* Create the message */
     ret = vCommand->create();
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     ret = vCommand->set_iface_id(ifaceInfo->name);
-    if (ret < 0)
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
 
     /* Add the vendor specific attributes for the NL command. */
@@ -1475,18 +1514,17 @@ static wifi_error wifi_get_packet_filter_capabilities(
     if (!nlData)
         goto cleanup;
 
-    if (vCommand->put_u32(
-            QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_SUB_CMD,
-            QCA_WLAN_GET_PACKET_FILTER_SIZE))
-    {
+    ret = vCommand->put_u32(QCA_WLAN_VENDOR_ATTR_PACKET_FILTER_SUB_CMD,
+                            QCA_WLAN_GET_PACKET_FILTER_SIZE);
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
-    }
+
     vCommand->attr_end(nlData);
 
     ret = vCommand->requestResponse();
-    if (ret) {
+    if (ret != WIFI_SUCCESS) {
         ALOGE("%s: requestResponse() error: %d", __FUNCTION__, ret);
-        if (ret == -ENOTSUP) {
+        if (ret == WIFI_ERROR_NOT_SUPPORTED) {
             /* Packet filtering is not supported currently, so return version
              * and length as 0
              */
@@ -1502,14 +1540,14 @@ static wifi_error wifi_get_packet_filter_capabilities(
     *max_len = vCommand->getFilterLength();
 cleanup:
     delete vCommand;
-    return mapErrorKernelToWifiHAL(ret);
+    return ret;
 }
 
 
 static wifi_error wifi_configure_nd_offload(wifi_interface_handle iface,
                                             u8 enable)
 {
-    int ret = WIFI_SUCCESS;
+    wifi_error ret;
     struct nlattr *nlData;
     WifiVendorCommand *vCommand = NULL;
 
@@ -1518,7 +1556,7 @@ static wifi_error wifi_configure_nd_offload(wifi_interface_handle iface,
                                 &vCommand);
     if (ret != WIFI_SUCCESS) {
         ALOGE("%s: Initialization failed", __func__);
-        return mapErrorKernelToWifiHAL(ret);
+        return ret;
     }
 
     ALOGV("ND offload : %s", enable?"Enable":"Disable");
@@ -1528,12 +1566,9 @@ static wifi_error wifi_configure_nd_offload(wifi_interface_handle iface,
     if (!nlData)
         goto cleanup;
 
-    if (vCommand->put_u8(
-            QCA_WLAN_VENDOR_ATTR_ND_OFFLOAD_FLAG,
-            enable))
-    {
+    ret = vCommand->put_u8(QCA_WLAN_VENDOR_ATTR_ND_OFFLOAD_FLAG, enable);
+    if (ret != WIFI_SUCCESS)
         goto cleanup;
-    }
 
     vCommand->attr_end(nlData);
 
@@ -1541,5 +1576,5 @@ static wifi_error wifi_configure_nd_offload(wifi_interface_handle iface,
 
 cleanup:
     delete vCommand;
-    return mapErrorKernelToWifiHAL(ret);
+    return ret;
 }

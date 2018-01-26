@@ -55,7 +55,8 @@ LOCAL_SRC_FILES := \
 	ring_buffer.cpp \
 	rb_wrapper.cpp \
 	rssi_monitor.cpp \
-	roam.cpp
+	roam.cpp \
+	wifihal_vendor.cpp
 
 LOCAL_MODULE := libwifi-hal-qcom
 LOCAL_PROPRIETARY_MODULE := true
@@ -116,7 +117,8 @@ LOCAL_SRC_FILES := \
 	ring_buffer.cpp \
 	rb_wrapper.cpp \
 	rssi_monitor.cpp \
-	roam.cpp
+	roam.cpp \
+	wifihal_vendor.cpp
 
 LOCAL_MODULE := libwifi-hal-qcom
 LOCAL_PROPRIETARY_MODULE := true
